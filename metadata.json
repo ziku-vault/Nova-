@@ -1,0 +1,6 @@
+{
+  "name": "Discord Study Bot",
+  "description": "A Discord study bot with a dashboard to manage pomodoro timers, todos, and motivation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

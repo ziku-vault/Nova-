@@ -544,6 +544,7 @@ const USER_DATA_DIR = path.join(process.cwd(), "user_data", "users");
 
 const saveUserStats = (userId: string, stats: UserStats) => {
   try {
+    userStats.set(userId, stats); // Update memory cache ✨
     const filePath = path.join(USER_DATA_DIR, `${userId}.json`);
     fs.writeFileSync(filePath, JSON.stringify(stats, null, 2));
   } catch (e) {
@@ -584,9 +585,12 @@ try {
 }
 
 const getUserStats = (userId: string): UserStats => {
+  const filePath = path.join(USER_DATA_DIR, `${userId}.json`);
+  
+  // If we have it in memory, return it
   if (userStats.has(userId)) return userStats.get(userId)!;
 
-  const filePath = path.join(USER_DATA_DIR, `${userId}.json`);
+  // Otherwise, fallback to disk
   let stats: UserStats;
 
   if (fs.existsSync(filePath)) {
@@ -1206,7 +1210,13 @@ client.on("interactionCreate", async interaction => {
       }
 
       const guildMembers = interaction.guild.members.cache;
-      const allKnownIds = new Set([...guildMembers.keys(), ...userStats.keys()]);
+      
+      // Collect IDs from Memory + Guild + Disk 📂
+      const diskIds = fs.readdirSync(USER_DATA_DIR)
+        .filter(f => f.endsWith(".json"))
+        .map(f => f.replace(".json", ""));
+
+      const allKnownIds = new Set([...guildMembers.keys(), ...userStats.keys(), ...diskIds]);
 
       const combinedStats = Array.from(allKnownIds)
         .map(id => {

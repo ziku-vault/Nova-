@@ -44,19 +44,19 @@ export default function App() {
         const data = await res.json();
         setStatus(data);
         setFetchError(null);
-        setIsWarmingUp(false);
+        setIsWarmingUp((prev) => (data.status === "online" ? false : prev)); // Only stop warming up if truly online
       } catch (err) {
-        console.error("Failed to fetch bot status", err);
+        // network error or parse error
+        const isNetworkError = err instanceof Error && (err.name === "TypeError" || err.message.includes("fetch"));
         
-        // If the fetch itself fails (network error), the server might be restarting.
-        // We revert to warming up state to give it a chance to recover without showing a big red error immediately.
-        setIsWarmingUp((prev) => {
-          // If we were already online, and now it failed, maybe show error after a few retries
-          return true;
-        });
-
-        if (!isWarmingUp) {
-          setFetchError("Connection lost. Nova might be restarting...");
+        if (isNetworkError) {
+          // Silent warming up if we lose connection (likely a restart)
+          setIsWarmingUp(true);
+        } else {
+          console.error("Failed to parse bot status", err);
+          if (!isWarmingUp) {
+            setFetchError("Dashboard data error. Please refresh.");
+          }
         }
       }
     };

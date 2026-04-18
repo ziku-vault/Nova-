@@ -305,6 +305,9 @@ const commands = [
     .addIntegerOption(option => option.setName("xp").setDescription("Exact XP amount").setRequired(false))
     .addIntegerOption(option => option.setName("hours").setDescription("Exact total focus hours").setRequired(false)),
   new SlashCommandBuilder()
+    .setName("admin-sync-all")
+    .setDescription("ADMIN: Force sync Discord memory with JSON files"),
+  new SlashCommandBuilder()
     .setName("test-summary")
     .setDescription("Test the monthly aesthetic summary DM"),
   new SlashCommandBuilder()
@@ -407,10 +410,56 @@ setInterval(async () => {
   }
 }, 1000);
 
+// Centralized XP & Time Award Logic ✨
+async function awardFocusRewards(session: PomodoroSession) {
+  if (session.isBreak) return { xpEarned: 0, elapsed: 0 };
+
+  const now = Date.now();
+  const remaining = session.isPaused 
+    ? session.remainingSeconds 
+    : Math.max(0, Math.floor((session.endTime - now) / 1000));
+  
+  const elapsed = Math.max(0, session.totalSeconds - remaining);
+  if (elapsed < 30) return { xpEarned: 0, elapsed }; // Minimum 30 seconds for XP
+
+  // Reward Scale: ~10 XP per 25 minutes of focus (Standard Pomodoro)
+  // This means roughly 1 XP for every 2.5 minutes (150 seconds)
+  const xpEarned = Math.floor((elapsed / 1500) * 10);
+  
+  for (const pId of session.participants) {
+    const stats = getUserStats(pId);
+    stats.xp += xpEarned;
+    stats.totalFocusTime += elapsed;
+    stats.level = Math.floor(stats.xp / 100) + 1;
+    saveUserStats(pId, stats);
+
+    // Sync Roles
+    if (session.guildId) {
+      try {
+        const guild = await client.guilds.fetch(session.guildId);
+        const member = await guild.members.fetch(pId);
+        if (member) await syncUserRoles(guild, member, stats);
+      } catch (e) {}
+    }
+  }
+
+  // Group Stats
+  if (session.groupId) {
+    const group = studyGroups.get(session.groupId);
+    if (group) {
+      group.totalSecondsFocused += elapsed;
+      saveStudyGroup(session.groupId, group);
+    }
+  }
+
+  return { xpEarned, elapsed };
+}
+
 async function handleSessionCompletion(session: PomodoroSession) {
   const { userId, isBreak, totalSeconds, participants, groupId, channelId, guildId, messageId } = session;
   
-  // Try to mark the original timer message as Finished 🏁
+  // Award rewards first
+  const { xpEarned, elapsed } = await awardFocusRewards(session);
   try {
     const channel = await client.channels.fetch(channelId);
     if (channel?.isTextBased() && messageId) {
@@ -429,32 +478,7 @@ async function handleSessionCompletion(session: PomodoroSession) {
   }
 
   if (!isBreak) {
-    // Award XP to ALL participants
-    for (const pId of participants) {
-      const stats = getUserStats(pId);
-      stats.xp += 10;
-      stats.totalFocusTime += totalSeconds;
-      stats.level = Math.floor(stats.xp / 100) + 1;
-      saveUserStats(pId, stats);
-
-      // Sync Roles for each participant
-      if (guildId) {
-        try {
-          const guild = await client.guilds.fetch(guildId);
-          const member = await guild.members.fetch(pId);
-          if (member) await syncUserRoles(guild, member, stats);
-        } catch (e) { /* ignore individual role sync errors */ }
-      }
-    }
-
-    // Group Stats
-    if (groupId) {
-      const group = studyGroups.get(groupId);
-      if (group) {
-        group.totalSecondsFocused += totalSeconds;
-        saveStudyGroup(groupId, group);
-      }
-    }
+    // Logic moved to awardFocusRewards()
   }
 
   // Send Completion Message & Pings
@@ -584,11 +608,11 @@ try {
   console.error("[STORAGE] Global error loading study groups:", e);
 }
 
-const getUserStats = (userId: string): UserStats => {
+const getUserStats = (userId: string, ignoreCache: boolean = false): UserStats => {
   const filePath = path.join(USER_DATA_DIR, `${userId}.json`);
   
-  // If we have it in memory, return it
-  if (userStats.has(userId)) return userStats.get(userId)!;
+  // If we have it in memory and it's not a fresh read, return it
+  if (!ignoreCache && userStats.has(userId)) return userStats.get(userId)!;
 
   // Otherwise, fallback to disk
   let stats: UserStats;
@@ -975,8 +999,10 @@ client.on("interactionCreate", async interaction => {
         const session = activeSessions.get(userId);
         if (session) {
           activeSessions.delete(userId);
+          const { xpEarned, elapsed } = await awardFocusRewards(session); // Award partial XP! ✨
+          
           await interaction.update({ 
-            content: "⏹️ Session stopped manually.",
+            content: `⏹️ Session stopped manually. Focused: **${formatDuration(elapsed)}**. ${xpEarned > 0 ? `You earned **${xpEarned}** XP! 🌸` : ""}`,
             embeds: [createPomodoroEmbed(session.totalSeconds, session.remainingSeconds, session.task, true, false, session.isBreak, userId, session.participants, session.endTime)],
             components: []
           });
@@ -1095,11 +1121,12 @@ client.on("interactionCreate", async interaction => {
       }
 
       activeSessions.delete(userId);
+      const { xpEarned, elapsed } = await awardFocusRewards(session); // Award partial XP! ✨
 
       const stopEmbed = new EmbedBuilder()
         .setTitle("⏱️ Nova Focus Session")
         .setColor("#fe9494")
-        .setDescription("Session stopped.")
+        .setDescription(`Session stopped. Focused: **${formatDuration(elapsed)}**. ${xpEarned > 0 ? `You earned **${xpEarned}** XP! 🌸` : ""}`)
         .addFields(
           { name: "Status", value: "🛑 Stopped", inline: true },
           { name: "Time Left", value: "Cancelled", inline: true },
@@ -1221,7 +1248,7 @@ client.on("interactionCreate", async interaction => {
 
       const combinedStats = Array.from(allKnownIds)
         .map(id => {
-          const stats = getUserStats(id);
+          const stats = getUserStats(id, true); // Force fresh read from disk! 📂✨
           const member = guildMembers.get(id);
           return { 
             id, 
@@ -1286,6 +1313,10 @@ client.on("interactionCreate", async interaction => {
         content: `🎁 Updated stats for <@${targetUser.id}>!\n✨ **XP:** ${stats.xp} (Level ${stats.level})\n⏰ **Focus Time:** ${hours ?? Math.floor(stats.totalFocusTime / 3600)}h`,
         ephemeral: false 
       });
+    } else if (commandName === "admin-sync-all") {
+      // Clear memory cache so everything reloads from disk ✨
+      userStats.clear();
+      await interaction.reply({ content: "♻️ **Memory Sync Complete!** Nova has re-read all student files from the system storage.", ephemeral: true });
     } else if (commandName === "status") {
       const uptime = Math.floor((Date.now() - startTime) / 1000);
       const h = Math.floor(uptime / 3600);
@@ -1513,16 +1544,28 @@ client.on("interactionCreate", async interaction => {
 });
 
 async function startServer() {
-  console.log("[SERVER] Initializing Nova server...");
+  // 1. Initialize App & Constants
   const app = express();
   const PORT = 3000;
 
-  // 🛡️ API Health & Status Routes (Defined first to be resilient)
+  // 2. Start Listening IMMEDIATELY 🚀
+  // This ensures the API is reachable even while Vite or Discord are warming up.
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`[SERVER] Nova listener active on port ${PORT}`);
+    console.log(`[SERVER] Startup Timestamp: ${new Date().toISOString()}`);
+  });
+
+  server.on("error", (err) => {
+    console.error("[SERVER] Fatal listener error:", err);
+    lastError = err.message;
+  });
+
+  // 3. API Health & Status Routes (Defined early for reliability)
   app.get("/api/bot-status", (req, res) => {
     try {
       res.json({
         status: botStatus,
-        servers: client.guilds?.cache?.size || 0,
+        servers: client?.guilds?.cache?.size || 0,
         uptime: botStatus === "online" ? Math.floor((Date.now() - startTime) / 1000) : 0,
         hasToken: !!DISCORD_TOKEN,
         hasGuildId: !!GUILD_ID,
@@ -1534,31 +1577,58 @@ async function startServer() {
   });
 
   app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", bot: botStatus });
+    res.json({ status: "ok", bot: botStatus, time: new Date().toISOString() });
   });
 
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // 4. Background Startup (Vite & Discord)
+  const initializeNova = async () => {
+    // Pre-cache Sound
     try {
-      console.log("[VITE] Initializing Vite in middleware mode...");
-      const vite = await createViteServer({
-        server: { middlewareMode: true },
-        appType: "spa",
-      });
-      app.use(vite.middlewares);
-      console.log("[VITE] Vite middleware initialized.");
-    } catch (viteError) {
-      console.error("[VITE] Failed to initialize Vite:", viteError);
+      console.log("[SERVER] Pre-caching notification sound...");
+      const response = await axios.get(BEEP_URL, { responseType: 'arraybuffer' });
+      cachedBeepBuffer = Buffer.from(response.data);
+      console.log("[SERVER] Sound cached.");
+    } catch (e) {
+      console.warn("[SERVER] Sound cache failed, falling back to stream.");
     }
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
 
-  // Monthly Aesthetic Summary (Runs on the 1st of every month)
+    // Discord Login
+    if (DISCORD_TOKEN) {
+      console.log("[DISCORD] Initializing client...");
+      client.login(DISCORD_TOKEN).catch(err => {
+        console.error("[DISCORD] Login failed:", err);
+        botStatus = "error";
+        lastError = err.message || String(err);
+      });
+    } else {
+      botStatus = "missing_token";
+    }
+
+    // Vite Middleware
+    if (process.env.NODE_ENV !== "production") {
+      try {
+        console.log("[VITE] Initializing development environment...");
+        const vite = await createViteServer({
+          server: { middlewareMode: true },
+          appType: "spa",
+        });
+        app.use(vite.middlewares);
+        console.log("[VITE] Ready.");
+      } catch (viteError) {
+        console.error("[VITE] Initialization failed:", viteError);
+      }
+    } else {
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+      app.get("*", (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
+  };
+
+  initializeNova(); // Run in background
+
+  // 5. Monthly Aesthetic Summary
   setInterval(async () => {
     const now = new Date();
     if (now.getDate() === 1 && now.getHours() === 9 && now.getMinutes() === 0) {
@@ -1577,40 +1647,6 @@ async function startServer() {
       }
     }
   }, 60000);
-
-  // Start listening after all middleware is set up
-  const server = app.listen(PORT, "0.0.0.0", async () => {
-    console.log(`[SERVER] Nova v1.0.1 (Hard Restart) running on http://0.0.0.0:${PORT}`);
-    console.log(`[SERVER] Restart Timestamp: ${new Date().toISOString()}`);
-    
-    // Pre-cache the beep sound
-    try {
-      console.log("[SERVER] Pre-caching notification sound...");
-      const response = await axios.get(BEEP_URL, { responseType: 'arraybuffer' });
-      cachedBeepBuffer = Buffer.from(response.data);
-      console.log("[SERVER] Notification sound cached successfully.");
-    } catch (e) {
-      console.error("[SERVER] Failed to pre-cache sound:", e);
-    }
-
-    // Now attempt Discord login
-    if (DISCORD_TOKEN) {
-      console.log("[DISCORD] Attempting to login...");
-      client.login(DISCORD_TOKEN).catch(err => {
-        console.error("[DISCORD] Failed to login:", err);
-        botStatus = "error";
-        lastError = err.message || String(err);
-      });
-    } else {
-      console.log("[DISCORD] No DISCORD_TOKEN provided. Bot will not start.");
-      botStatus = "missing_token";
-    }
-  });
-
-  server.on("error", (err) => {
-    console.error("[SERVER] Server error:", err);
-    lastError = err.message;
-  });
 }
 
 startServer();

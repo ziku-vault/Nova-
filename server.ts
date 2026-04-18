@@ -634,6 +634,7 @@ const getUserStats = (userId: string): UserStats => {
   };
   
   userStats.set(userId, stats);
+  saveUserStats(userId, stats); // Write the JSON code to the file immediately! 🪄
   return stats;
 };
 
